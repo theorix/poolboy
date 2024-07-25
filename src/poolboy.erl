@@ -11,6 +11,7 @@
 -export_type([pool/0]).
 
 -define(TIMEOUT, 5000).
+-define(OVERFLOW_TIMEOUT, 10000).
 
 -ifdef(pre17).
 -type pid_queue() :: queue().
@@ -44,7 +45,8 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    overflow_timer :: undefined | reference()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -275,7 +277,35 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
                     {noreply, State}
             end
     end;
-
+handle_info({timeout, TimerRef, overflow_timeout},
+            #state{supervisor = Sup,
+                   waiting = Waiting,
+                   workers = Workers,
+                   strategy = Strategy,
+                   overflow = Overflow,
+                   overflow_timer = TimerRef} =
+                State) ->
+    case queue:is_empty(Waiting) andalso Overflow > 0 of
+        true ->
+            {NewWorkers, NewOverflow} =
+                lists:foldl(fun(_, {TWorkers, TOverflow}) ->
+                               case get_worker_with_strategy(TWorkers, Strategy) of
+                                   {{value, Pid}, Left} ->
+                                       ok = dismiss_worker(Sup, Pid),
+                                       {Left, TOverflow - 1};
+                                   {empty, _Left} ->
+                                       {TWorkers, TOverflow}
+                               end
+                            end,
+                            {Workers, Overflow},
+                            lists:seq(1, Overflow)),
+            {noreply,
+             State#state{workers = NewWorkers,
+                         overflow = NewOverflow,
+                         overflow_timer = undefined}};
+        false ->
+            {noreply, State#state{overflow_timer = undefined}}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -332,15 +362,22 @@ handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
            waiting = Waiting,
            monitors = Monitors,
-           overflow = Overflow} = State,
+           overflow = Overflow,
+           overflow_timer = OverflowTimer} = State,
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
+        {empty, Empty} when Overflow > 0 andalso OverflowTimer == undefined ->
+            NewOverflowTimer = erlang:start_timer(?OVERFLOW_TIMEOUT, self(), overflow_timeout),
+            Workers = queue:in(Pid, State#state.workers),
+            State#state{workers = Workers,
+                        waiting = Empty,
+                        overflow_timer = NewOverflowTimer};
         {empty, Empty} when Overflow > 0 ->
-            ok = dismiss_worker(Sup, Pid),
-            State#state{waiting = Empty, overflow = Overflow - 1};
+            Workers = queue:in(Pid, State#state.workers),
+            State#state{workers = Workers, waiting = Empty};
         {empty, Empty} ->
             Workers = queue:in(Pid, State#state.workers),
             State#state{workers = Workers, waiting = Empty, overflow = 0}
